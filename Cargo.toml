@@ -3,4 +3,14 @@ name = "smol_tftp"
 version = "0.1.0"
 edition = "2024"
 
+[library]
+name = "smol_tftp"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["std"]
+std = ["smoltcp/std"]
+
 [dependencies]
+smoltcp = { version =  "0.12.0", default-features = false, features = ["proto-ipv4", "proto-ipv6", "medium-ip", "socket-udp"] }
