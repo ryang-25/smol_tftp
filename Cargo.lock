@@ -130,6 +130,7 @@ dependencies = [
 name = "smol_tftp"
 version = "0.1.0"
 dependencies = [
+ "managed",
  "smoltcp",
 ]
 
