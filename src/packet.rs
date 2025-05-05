@@ -9,8 +9,8 @@ use crate::error::Result;
 
 /// The max number of bytes sent at a time.
 pub const DATA_SIZE: usize = 512;
-
-pub const META_SIZE: usize = 4;
+pub(crate) const META_SIZE: usize = 4;
+pub(crate) const PACKET_SIZE: usize = META_SIZE + DATA_SIZE;
 
 enum_with_unknown! {
     /// The five TFTP packet types. 2 bytes in length.
@@ -31,11 +31,12 @@ enum_with_unknown! {
 mod field {
     use core::ops::{Range, RangeFrom};
 
-    pub(crate) const TYPE: Range<usize> = 0..1;
+    pub(crate) const TYPE: Range<usize> = 0..2;
     pub const FILENAME: RangeFrom<usize> = 2..;
     pub const BLOCK: Range<usize> = 2..3;
     pub const CODE: Range<usize> = 2..3;
     pub const MSG: RangeFrom<usize> = 3..;
+    pub const DATA: RangeFrom<usize> = 3..;
 }
 
 /// A TFTP packet.
@@ -71,23 +72,17 @@ impl<T: AsRef<[u8]>> Packet<T> {
         self.buffer
     }
 
-
     /// Return the type of the packet.
     pub fn type_(&self) -> Type {
         unsafe { read_be_u16(&self.buffer.as_ref()[field::TYPE]).into() }
     }
 
-    ///
-    ///
-    /// or if the filename is not
-    /// encoded in netascii.
+    /// Returns the filename of the data block
     pub fn filename(&self) -> Result<&str> {
         match self.type_() {
             Type::Rrq | Type::Wrq => netascii_from_u8(&self.buffer.as_ref()[field::FILENAME]),
             _ => Err(todo!()),
         }
-
-        // netascii_from_u8(&self.buffer.as_ref()[FILENAME])
     }
 
     /// Reads the block number of the packet. Panics if the packet is missing
@@ -101,11 +96,19 @@ impl<T: AsRef<[u8]>> Packet<T> {
     }
 
     pub fn data(&self) -> &[u8] {
-        todo!()
+        &self.buffer.as_ref()[field::DATA]
     }
 
-    fn mode(&self) -> &str {
-        todo!()
+    fn mode_index(&self) -> usize {
+        let start = field::FILENAME.start;
+        memchr(&self.as_ref()[field::FILENAME], 0).unwrap() + start + 1
+    }
+
+    fn mode(&self) -> Result<&str> {
+        match self.type_() {
+            Type::Rrq | Type::Wrq => netascii_from_u8(&self.as_ref()[self.mode_index()..]),
+            _ => Err(todo!()),
+        }
     }
 
     fn error_code() {}
@@ -130,12 +133,25 @@ where
         self.buffer.as_mut()[field::CODE].copy_from_slice(&code.to_be_bytes());
     }
 
+    pub fn set_file_name(&mut self, file_name: &CStr) {
+        self.buffer.as_mut()[field::FILENAME][..file_name.count_bytes() + 1]
+            .copy_from_slice(file_name.to_bytes_with_nul());
+    }
+
+    pub fn set_mode(&mut self, mode: &CStr) {
+        let start = field::FILENAME.start;
+        let pos = memchr(&self.as_ref()[field::FILENAME], 0).unwrap() + start + 1;
+        self.buffer.as_mut()[pos..][..mode.count_bytes() + 1]
+            .copy_from_slice(mode.to_bytes_with_nul());
+    }
+
+    /// Set the error message for an error packet.
     pub fn set_msg(&mut self, msg: &CStr) {
         self.buffer.as_mut()[field::MSG].copy_from_slice(msg.to_bytes_with_nul());
     }
 
     pub fn data_mut(&mut self) -> &mut [u8] {
-        todo!()
+        &mut self.buffer.as_mut()[field::DATA]
     }
 }
 
@@ -144,7 +160,6 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
         self.buffer.as_ref()
     }
 }
-
 
 pub enum Repr<'a> {
     // data field of data may only be 512 bytes in length.
@@ -168,8 +183,6 @@ impl<'a> Repr<'a> {
             }),
             _ => todo!(),
         }
-
-        // todo!()
     }
 
     pub fn emit<T>(&self, packet: &mut Packet<T>)
@@ -197,8 +210,6 @@ impl<'a> Repr<'a> {
     }
 }
 
-struct Header {}
-
 /// Read a slice of exactly two bytes as a big endian u16.
 ///
 /// # Safety
@@ -206,10 +217,6 @@ struct Header {}
 unsafe fn read_be_u16(buf: &[u8]) -> u16 {
     let ptr: &[u8; 2] = unsafe { &*buf.as_ptr().cast() };
     u16::from_be_bytes(*ptr)
-}
-
-fn validate_netascii(s: &str) -> bool {
-    todo!()
 }
 
 /// Converts a slice of bytes into a netascii string slice.

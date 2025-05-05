@@ -1,11 +1,14 @@
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+
 #[macro_use]
 mod macros;
 
-mod error;
+pub mod error;
 pub mod packet;
-// mod socket;
 
 #[cfg(feature = "std")]
-mod client;
+pub mod device;
+
+pub mod client;
 #[cfg(feature = "std")]
 mod server;
