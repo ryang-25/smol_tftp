@@ -24,9 +24,9 @@ fn main() -> Result<()> {
     match args[2].as_str() {
         "read" => {
             let mut f = File::create(path)?;
-            client.receive_file(&CString::new(file_name.as_bytes())?, c"binary", &mut f)?
+            client.receive_file(&CString::new(file_name.as_bytes())?, c"octet", &mut f)?
         }
-        "write" => client.send_file(path, c"binary")?,
+        "write" => client.send_file(path, c"octet")?,
         _ => todo!(),
     };
     Ok(())

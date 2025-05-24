@@ -33,8 +33,8 @@ mod field {
 
     pub(crate) const TYPE: Range<usize> = 0..2;
     pub const FILENAME: RangeFrom<usize> = 2..;
-    pub const BLOCK: Range<usize> = 2..3;
-    pub const CODE: Range<usize> = 2..3;
+    pub const BLOCK: Range<usize> = 2..4;
+    pub const CODE: Range<usize> = 2..4;
     pub const MSG: RangeFrom<usize> = 3..;
     pub const DATA: RangeFrom<usize> = 3..;
 }
@@ -95,10 +95,6 @@ impl<T: AsRef<[u8]>> Packet<T> {
         unsafe { read_be_u16(b) }
     }
 
-    pub fn data(&self) -> &[u8] {
-        &self.buffer.as_ref()[field::DATA]
-    }
-
     fn mode_index(&self) -> usize {
         let start = field::FILENAME.start;
         memchr(&self.as_ref()[field::FILENAME], 0).unwrap() + start + 1
@@ -114,6 +110,24 @@ impl<T: AsRef<[u8]>> Packet<T> {
     fn error_code() {}
 
     fn error_msg() {}
+}
+
+/// We need the lifetimes like this so that we can borrow the data for as long as we borrow the packet, without dropping.
+impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
+    pub fn data(&self) -> &'a [u8] {
+        &self.buffer.as_ref()[field::DATA]
+    }
+}
+
+/// Obtain the data and block numbers from a packet buffer, returning an error if it isn't a data packet.
+pub(crate) fn packet_data_block<'b, U: AsRef<[u8]> + ?Sized>(
+    buf: &'b U,
+) -> Result<(&'b [u8], u16)> {
+    let packet = Packet::new_checked(buf)?;
+    if packet.type_() != Type::Data {
+        todo!()
+    }
+    Ok((packet.data(), packet.block()))
 }
 
 impl<T> Packet<T>
@@ -171,7 +185,7 @@ pub enum Repr<'a> {
 }
 
 impl<'a> Repr<'a> {
-    pub fn parse<T>(packet: &'a Packet<T>) -> Result<Self>
+    pub fn parse<T>(packet: &'a Packet<&'a T>) -> Result<Self>
     where
         T: AsRef<[u8]>,
     {

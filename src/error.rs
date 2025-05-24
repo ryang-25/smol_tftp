@@ -4,7 +4,7 @@ use smoltcp::{
 };
 
 #[cfg(feature = "std")]
-use std::{ffi::NulError, io::Error as IoError, net::SocketAddr};
+use std::{ffi::NulError, io::Error as IoError};
 
 #[derive(Debug)]
 #[non_exhaustive]

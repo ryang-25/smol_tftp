@@ -81,6 +81,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "log"
+version = "0.4.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
+
+[[package]]
 name = "managed"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -130,6 +136,7 @@ dependencies = [
 name = "smol_tftp"
 version = "0.1.0"
 dependencies = [
+ "heapless",
  "managed",
  "smoltcp",
 ]
@@ -145,6 +152,7 @@ dependencies = [
  "cfg-if",
  "defmt 0.3.100",
  "heapless",
+ "log",
  "managed",
 ]
 
