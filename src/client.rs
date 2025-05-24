@@ -4,29 +4,31 @@ use crate::device::UdpSocketDevice;
 use crate::{
     error::{Error, Result},
     // file::PacketChunks,
-    packet::{DATA_SIZE, META_SIZE, PACKET_SIZE, Packet, Type},
+    packet::{DATA_SIZE, META_SIZE, PACKET_SIZE, Packet, Type, packet_data_block},
 };
 
 use core::ffi::CStr;
 use managed::ManagedSlice;
 use smoltcp::{
-    iface::{
-        Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
-        SocketStorage,
-    },
+    iface::{Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage},
     phy::Device,
     socket::udp::{Socket as UdpSocket, UdpMetadata},
     storage::PacketBuffer,
     time::Instant,
-    wire::IpEndpoint,
+    wire::{IpCidr, IpEndpoint},
 };
 
 #[cfg(all(feature = "std", unix))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(feature = "std")]
 use std::{
-    ffi::CString, fs::File, io::Error as IoError, io::ErrorKind as IoErrorKind, io::Read,
-    io::Write, net::SocketAddr, path::Path,
+    ffi::CString,
+    fs::File,
+    io::Error as IoError,
+    io::ErrorKind as IoErrorKind,
+    io::{Read, Write},
+    net::SocketAddr,
+    path::Path,
 };
 
 #[cfg(feature = "std")]
@@ -34,7 +36,6 @@ pub struct StdClient<'a>(Client<'a, UdpSocketDevice>);
 
 #[cfg(feature = "std")]
 impl<'a> StdClient<'a> {
-    /// hello!
     pub fn new(addr: SocketAddr, server_addr: SocketAddr) -> Result<Self> {
         use smoltcp::socket::udp::PacketMetadata;
 
@@ -128,10 +129,15 @@ impl<'a, T: Device> Client<'a, T> {
     {
         let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
         socket.bind(addr)?;
-        // [SocketStorage::EMPTY; 1]
         let mut sockets = SocketSet::new(sockets);
         let handle = sockets.add(socket);
-        let iface = Interface::new(config, &mut device, now);
+        // Okay so the problem
+        let mut iface = Interface::new(config, &mut device, now);
+        // Let the interface receive packets, even those that aren't directed
+        // to us.
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(addr.addr, 16)).unwrap();
+        });
         Ok(Self {
             server_addr,
             sockets,
@@ -166,6 +172,14 @@ impl<'a, T: Device> Client<'a, T> {
         Ok(())
     }
 
+    /// Send an acknowledgement packet with block number to the server.
+    fn send_ack(&mut self, block: u16) -> Result<()> {
+        let mut packet = unsafe { Packet::new_unchecked([0; 4]) };
+        packet.set_type(Type::Ack.into());
+        packet.set_block(block);
+        self.send_packet(packet)
+    }
+
     /// Open a read connection with file_name and the specified mode.
     pub fn start_read(
         &'a mut self,
@@ -186,34 +200,7 @@ impl<'a, T: Device> Client<'a, T> {
 
         // Send the packet.
         self.send_packet(rrq_packet)?;
-        self.iface
-            .poll_egress(Instant::ZERO, &mut self.device, &mut self.sockets);
-
-        // Wait for our first DATA packet, which originates from the server's TID.
-        loop {
-            while let PollIngressSingleResult::None =
-                self.iface
-                    .poll_ingress_single(Instant::ZERO, &mut self.device, &mut self.sockets)
-            {
-            }
-            // Allocate space for the first packet.
-            let mut first = [0; PACKET_SIZE];
-            // Obtain the packet size from the network to resize too-small packets.
-            let (size, meta) = self
-                .sockets
-                .get_mut::<UdpSocket>(self.handle)
-                .recv_slice(&mut first)?;
-            let packet = Packet::new_checked(first)?;
-            if packet.type_() != Type::Data {
-                todo!();
-            }
-            self.server_addr = meta.endpoint;
-            return Ok(ReadConnection {
-                client: self,
-                packet,
-                size,
-            });
-        }
+        return Ok(ReadConnection { client: self });
     }
 
     /// Start a write connection with the given file_name and mode.
@@ -257,84 +244,77 @@ impl<'a, T: Device> Client<'a, T> {
 pub struct ReadConnection<'a, T: Device> {
     // An internal client wrapper
     client: &'a mut Client<'a, T>,
-    // The size of the first packet, used for resizing.
-    size: usize,
-    // A buffer to hold the first data packet.
-    packet: Packet<[u8; PACKET_SIZE]>,
 }
 
 impl<'a, T: Device> ReadConnection<'a, T> {
-    /// A read connection reads a file from the socket. Panics if the buffer is smaller than the data received.
-    pub fn read_file(&mut self, buf: &mut [u8]) -> Result<()> {
-        let size = self.size - META_SIZE;
-        // Copy the first data packet into the buffer.
-        buf[0..size].copy_from_slice(self.packet.data());
-        if size < DATA_SIZE {
-            return Ok(()); // leave if less than one packet is transferred
-        }
+    fn poll(&mut self) -> PollResult {
+        self.client.iface.poll(
+            Instant::ZERO,
+            &mut self.client.device,
+            &mut self.client.sockets,
+        )
+    }
 
-        let mut start = size;
+    fn get_socket(&mut self) -> &mut UdpSocket<'a> {
+        self.client.sockets.get_mut::<UdpSocket>(self.client.handle)
+    }
+
+    /// A read connection reads a file from the socket. Panics if the buffer is smaller than the data received.
+    pub fn read_file<const N: usize>(&mut self, buf: &mut heapless::Vec<u8, N>) -> Result<()> {
+        let mut current_block = 0;
         loop {
-            let client = &mut self.client;
             // Spin if there's no work to be done
-            while let PollIngressSingleResult::None = client.iface.poll_ingress_single(
-                Instant::ZERO,
-                &mut client.device,
-                &mut client.sockets,
-            ) {
-                // should we sleep between polls?
+            while !self.get_socket().can_recv() {
+                self.poll();
             }
-            let (pkt, meta) = client.sockets.get_mut::<UdpSocket>(client.handle).recv()?;
-            if meta.endpoint != client.server_addr {
+
+            let server_addr = self.client.server_addr;
+            let (pkt, meta) = self.get_socket().recv()?;
+            if current_block != 0 && meta.endpoint != server_addr {
                 todo!("send an error packet if tid validation fails!");
             }
-            let packet = Packet::new_checked(pkt)?;
-            if packet.type_() != Type::Data {
-                todo!();
+
+            let (data, block) = packet_data_block(pkt)?;
+            if block > current_block {
+                buf.extend(data.iter().cloned());
+                if data.len() < DATA_SIZE {
+                    return Ok(());
+                }
+                current_block += 1;
             }
-            let len = packet.data().len();
-            buf[start..start + len].copy_from_slice(packet.data());
-            if len < DATA_SIZE {
-                return Ok(());
-            }
-            // Advance to next
-            start += len;
+
+            self.client.send_ack(current_block)?;
         }
     }
 
-    /// A read connection reads a file from the socket, writing it with a writer.
     #[cfg(feature = "std")]
+    /// A read connection reads a file from the socket, writing it with a writer.
     pub fn read_file_io<W: Write>(&mut self, writer: &mut W) -> Result<()> {
-        let size = self.size - META_SIZE;
-        writer.write(self.packet.data())?;
-        if size < DATA_SIZE {
-            return Ok(()); // leave if less than one packet is transferred
-        }
-
+        let mut current_block = 0;
         loop {
-            let client = &mut self.client;
             // Spin if there's no work to be done
-            while let PollIngressSingleResult::None = client.iface.poll_ingress_single(
-                Instant::ZERO,
-                &mut client.device,
-                &mut client.sockets,
-            ) {
-                // should we sleep between polls?
-                println!("hellooo");
+            while !self.get_socket().can_recv() {
+                self.poll();
             }
-            let (pkt, meta) = client.sockets.get_mut::<UdpSocket>(client.handle).recv()?;
-            if meta.endpoint != client.server_addr {
+
+            let server_addr = self.client.server_addr;
+            let (pkt, meta) = self.get_socket().recv()?;
+            if current_block != 0 && meta.endpoint != server_addr {
                 todo!("send an error packet if tid validation fails!");
             }
-            let packet = Packet::new_checked(pkt)?;
-            if packet.type_() != Type::Data {
-                todo!();
+
+            let (data, block) = packet_data_block(pkt)?;
+            if block > current_block {
+                writer.write(data)?;
+                if data.len() < DATA_SIZE {
+                    return Ok(());
+                }
+                current_block += 1;
             }
-            writer.write(packet.data())?;
-            let len = packet.data().len();
-            if len < DATA_SIZE {
-                return Ok(());
+            if current_block == 1 {
+                self.client.server_addr = meta.endpoint;
             }
+            self.client.send_ack(current_block)?;
         }
     }
 }

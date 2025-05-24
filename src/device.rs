@@ -6,8 +6,9 @@ use smoltcp::{
 };
 
 use std::{
-    io::Result,
+    io::{ErrorKind, Result},
     net::{IpAddr, SocketAddr, UdpSocket},
+    time::Duration,
 };
 
 pub struct RxToken(Vec<u8>);
@@ -40,10 +41,12 @@ fn set_udp_headers<T: AsRef<[u8]> + AsMut<[u8]>>(
     src_addr: &IpEndpoint,
     dst_addr: &IpEndpoint,
     packet: &mut UdpPacket<T>,
+    payload: &[u8],
 ) {
     packet.set_src_port(src_addr.port);
     packet.set_dst_port(dst_addr.port);
     packet.set_len((packet.as_ref().len()) as u16);
+    packet.payload_mut().copy_from_slice(payload);
     packet.fill_checksum(&src_addr.addr, &dst_addr.addr);
 }
 
@@ -54,16 +57,18 @@ fn craft_raw_packet(src_addr: &IpEndpoint, dst_addr: &IpEndpoint, packet: &[u8])
         (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
             let mut buffer = vec![0; pkt_len + 20 + 8];
             let mut udp_packet = UdpPacket::new_unchecked(&mut buffer[20..]);
-            set_udp_headers(src_addr, dst_addr, &mut udp_packet);
+            set_udp_headers(src_addr, dst_addr, &mut udp_packet, packet);
 
             // Set IPv4 headers.
             let mut ip_packet = Ipv4Packet::new_unchecked(&mut buffer);
             ip_packet.set_version(4);
+            ip_packet.set_next_header(smoltcp::wire::IpProtocol::Udp);
             ip_packet.set_dont_frag(true);
             ip_packet.set_hop_limit(64);
             ip_packet.set_total_len(ip_packet.as_ref().len() as u16);
             ip_packet.set_src_addr(src);
             ip_packet.set_dst_addr(dst);
+            ip_packet.set_header_len(20);
             ip_packet.fill_checksum();
 
             buffer
@@ -72,7 +77,7 @@ fn craft_raw_packet(src_addr: &IpEndpoint, dst_addr: &IpEndpoint, packet: &[u8])
             let mut buffer = vec![0; pkt_len + 40 + 8];
             let mut udp_packet = UdpPacket::new_unchecked(&mut buffer[40..]);
             let udp_len = udp_packet.as_ref().len();
-            set_udp_headers(src_addr, dst_addr, &mut udp_packet);
+            set_udp_headers(src_addr, dst_addr, &mut udp_packet, packet);
 
             // Set IPv6 headers.
             let mut ip_packet = Ipv6Packet::new_unchecked(&mut buffer);
@@ -116,7 +121,9 @@ impl UdpSocketDevice {
         let socket = UdpSocket::bind(src_addr)?;
         // If we bind to an ephemeral port the OS selects one for us, so the port that was bound may differ from the original.
         let bound_addr = socket.local_addr()?;
-        println!("{bound_addr}");
+        // Set timeouts so that we don't block indefinitely.
+        socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+        socket.set_write_timeout(Some(Duration::from_millis(500)))?;
         Ok((
             Self {
                 socket,
@@ -144,12 +151,14 @@ impl smoltcp::phy::Device for UdpSocketDevice {
         match self.socket.recv_from(&mut buffer) {
             Ok((size, dst_addr)) => {
                 buffer.resize(size, 0);
-                let raw = craft_raw_packet(&self.src_addr, &dst_addr.into(), &buffer);
+                // swap source and destination when receiving.
+                let raw = craft_raw_packet(&dst_addr.into(), &self.src_addr, &buffer);
                 let rx = RxToken(raw);
                 let tx = TxToken(&self.socket);
                 Some((rx, tx))
             }
-            Err(err) => panic!("{err}"),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => None,
+            Err(e) => panic!("{e}"),
         }
     }
 
